@@ -7,7 +7,7 @@ import seaborn as sns
 from torchmetrics import Accuracy
 from metrics import UnsupervisedAccuracy
 from loss_helpers import kernel_cross_entropy, kernel_mse_loss, kernel_dot_loss
-
+import copy 
 class KernelModel(pl.LightningModule):
     def __init__(self, 
                  mapper, 
@@ -18,7 +18,9 @@ class KernelModel(pl.LightningModule):
                  lr=1e-3, 
                  accuracy_mode=None, 
                  loss_type='cross_entropy', 
-                 regularization_coeff=0):
+                 regularization_coeff=0,
+                 use_ema=False,
+                 ema_momentum=0.999):
         
         super().__init__()
         self.mapper = mapper
@@ -31,13 +33,43 @@ class KernelModel(pl.LightningModule):
         self.val_loss_epoch = 0
         self.regularization_coeff = regularization_coeff
         self.accuracy_mode = accuracy_mode
-
+        self.use_ema = use_ema
+        self.ema_momentum = ema_momentum
+        
+        # Create EMA mapper if enabled
+        if self.use_ema:
+            self.ema_mapper = self._create_ema_mapper()
+            self._copy_weights_to_ema()
+        
         self.loss = self._select_loss_function(loss_type)
         self.train_acc, self.val_acc = self._configure_accuracy_metrics(accuracy_mode, num_classes)
 
+    def _create_ema_mapper(self):
+        """Creates a copy of the mapper network for EMA."""
+        ema_mapper = copy.deepcopy(self.mapper)
+        ema_mapper.eval()  # EMA is not updated through backprop
+        for param in ema_mapper.parameters():
+            param.requires_grad = False
+        return ema_mapper
+
+    def _copy_weights_to_ema(self):
+        """Copies the current weights to the EMA mapper."""
+        for ema_param, param in zip(self.ema_mapper.parameters(), self.mapper.parameters()):
+            ema_param.data.copy_(param.data)
+
+    def _update_ema_weights(self):
+        """Updates EMA weights using the momentum parameter."""
+        with torch.no_grad():
+            for ema_param, param in zip(self.ema_mapper.parameters(), self.mapper.parameters()):
+                ema_param.data = self.ema_momentum * ema_param.data + (1.0 - self.ema_momentum) * param.data
+
     def forward(self, x):
         return self.mapper(x)
-
+    
+    def forward_ema(self, x):
+        """Forward pass through the EMA mapper."""
+        return self.ema_mapper(x)
+    
     def loss_fn(self, target_kernel, learned_kernel):
         return self.loss(target_kernel, learned_kernel)
 
@@ -51,8 +83,16 @@ class KernelModel(pl.LightningModule):
         features, labels, idx = batch
         embeddings = self.embeddings_map(self.forward(features))
 
+        # Generate EMA embeddings if EMA is enabled
+        if self.use_ema:
+            with torch.no_grad():
+                ema_embeddings = self.embeddings_map(self.forward_ema(features))
+                ema_embeddings = (ema_embeddings + embeddings) / 2
+        else:
+            ema_embeddings = embeddings  # Use same embeddings if EMA is disabled
+
         target_kernel = self.target_kernel(features, labels, idx)
-        learned_kernel = self.learned_kernel(embeddings, labels, idx)
+        learned_kernel = self.learned_kernel(([embeddings, ema_embeddings]), labels, idx)
 
         loss = self.loss_fn(target_kernel, learned_kernel)
         regularization_term = self.regularization_term(embeddings, target_kernel)
@@ -62,6 +102,10 @@ class KernelModel(pl.LightningModule):
             self._log_training_step(loss, regularization_term, total_loss)
             self.train_loss_epoch += loss.item()
             self._update_accuracy(embeddings, labels, self.train_acc)
+            
+            if self.use_ema:
+                self._update_ema_weights()  # Update EMA weights during training
+
         else:
             self.validation_step_outputs.append({
                 'embeddings': embeddings,
@@ -130,6 +174,7 @@ class KernelModel(pl.LightningModule):
 
         accuracy = acc_metric.compute()
         self.log(f'{phase}_accuracy', accuracy, on_epoch=True)
+        print(f'{phase} accuracy: {accuracy}')
         acc_metric.reset()
 
     def _log_training_step(self, loss, regularization_term, total_loss):
@@ -140,8 +185,11 @@ class KernelModel(pl.LightningModule):
     def _aggregate_validation_outputs(self):
         outputs = self.validation_step_outputs
         all_embeddings = torch.cat([output['embeddings'] for output in outputs], dim=0)
+        print(all_embeddings.shape)
         all_labels = torch.cat([output['labels'] for output in outputs], dim=0)
         all_learned_kernels = torch.cat([output['learned_kernel'] for output in outputs], dim=0)
         all_target_kernels = torch.cat([output['target_kernel'] for output in outputs], dim=0)
         self.validation_step_outputs.clear()
         return all_embeddings.cpu(), all_labels.cpu(), all_learned_kernels.cpu(), all_target_kernels.cpu()
+    
+    

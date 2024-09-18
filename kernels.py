@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+################## Kernels Base Class ##################
 class Kernel(nn.Module):
     def __init__(self):
         super(Kernel, self).__init__()
@@ -49,6 +50,7 @@ class Kernel(nn.Module):
     def neighbor_propagation(self, steps=1):
         return NeighborPropagationKernel(self, steps=steps)
 
+################## Kernel Operations ##################
 class CompositeKernel(Kernel):
     def __init__(self, kernels, operation='add'):
         super(CompositeKernel, self).__init__()
@@ -137,26 +139,48 @@ class MaxKernel(Kernel):
         output2 = self.kernel2(*args, **kwargs)
         
         return torch.max(output1, output2)
-    
-class ClusteringKernel(Kernel):
-    def forward(self, cluster_probabilities, labels = None, idx = None):
-        cluster_sizes = cluster_probabilities.sum(dim=0)
-        neighbors_prob = (cluster_probabilities / cluster_sizes) @ cluster_probabilities.t()
-        return neighbors_prob
+
+class NeighborPropagationKernel(Kernel):
+    def __init__(self, base_kernel, steps=1):
+        super(NeighborPropagationKernel, self).__init__()
+        self.base_kernel = base_kernel
+        self.steps = steps
+
+    def forward(self, *args, **kwargs):
+        # Compute the base adjacency matrix
+        adj_matrix = self.base_kernel(*args, **kwargs)
+        adj_matrix = (adj_matrix+ adj_matrix.T)/2
         
+        # Apply neighbor propagation for the specified number of steps
+        smooth_adj_matrix = adj_matrix.clone()
+        for _ in range(self.steps):
+            smooth_adj_matrix = torch.mm(smooth_adj_matrix, adj_matrix)
+            smooth_adj_matrix = (smooth_adj_matrix > 0).float()
+
+        return smooth_adj_matrix
+
+
+
+################## Distance Kernels ##################
 class DistancesKernel(Kernel):
     def __init__(self, type='euclidean'):
         super(DistancesKernel, self).__init__()
         self.type = type
 
-    def forward(self, features, labels = None, idx = None):
+    def forward(self, features, labels=None, idx=None):
+        if features.dim() == 2:
+            online_features, ema_features = features, features
+        else:
+            online_features, ema_features = features[0], features[1]
+
         if self.type == 'euclidean':
-            distances = torch.cdist(features, features, p=2)
+            distances = torch.cdist(online_features, ema_features, p=2)
         elif self.type == 'cosine':
-            features = F.normalize(features, p=2, dim=1)
-            distances = -features @ features.T
+            online_features = F.normalize(online_features, p=2, dim=1)
+            ema_features = F.normalize(ema_features, p=2, dim=1)
+            distances = -online_features @ ema_features.T
         elif self.type == 'dot':
-            distances = -features @ features.T
+            distances = -online_features @ ema_features.T
         return distances
 
 class GaussianKernel(Kernel):
@@ -181,7 +205,7 @@ class GaussianKernel(Kernel):
         distances = DistancesKernel(type=self.type)(features)
 
         if self.mask_diagonal:
-            mask = 1 - torch.eye(features.size(0), device=features.device)
+            mask = 1 - torch.eye(distances.size(0), device=distances.device)
             distances.masked_fill(mask == 0, float('inf'))
 
         # Step 2: Select the mode and compute probabilities
@@ -254,18 +278,6 @@ class GaussianKernel(Kernel):
 
         return P
 
-
-class PartialGaussianKernel(GaussianKernel):
-    def __init__(self, sigma, mask, type='euclidean'):
-        super(PartialGaussianKernel, self).__init__(sigma, type=type)
-        self.mask = mask
-
-    def forward(self, features, labels = None, idx = None):
-        distances = DistancesKernel(type=self.type)(features)
-        distances.masked_fill(self.mask == 0, -float('inf'))
-        neighbors_prob = F.softmax(-distances / self.sigma**2, dim=1)
-        return neighbors_prob
-
 class CauchyKernel(Kernel):
     def __init__(self, gamma, type='euclidean', mask_diagonal=True):
         super(CauchyKernel, self).__init__()
@@ -282,24 +294,7 @@ class CauchyKernel(Kernel):
         neighbors_prob = F.normalize(neighbors_prob_unormalized, p=1, dim=1)
         return neighbors_prob
 
-
-class NeighborPropagationKernel(Kernel):
-    def __init__(self, base_kernel, steps=1):
-        super(NeighborPropagationKernel, self).__init__()
-        self.base_kernel = base_kernel
-        self.steps = steps
-
-    def forward(self, *args, **kwargs):
-        # Compute the base adjacency matrix
-        adj_matrix = self.base_kernel(*args, **kwargs)
-        
-        # Apply neighbor propagation for the specified number of steps
-        smooth_adj_matrix = adj_matrix.clone()
-        for _ in range(self.steps):
-            smooth_adj_matrix = torch.mm(smooth_adj_matrix, adj_matrix)
-            smooth_adj_matrix = (smooth_adj_matrix > 0).float()
-
-        return smooth_adj_matrix
+################## Graph Kernels ##################
 
 class KnnKernel(Kernel):
     def __init__(self, k, type='euclidean'):
@@ -330,7 +325,7 @@ class LabelsKernel(Kernel):
 class AugmentationKernel(Kernel):
     def forward(self, features=None, labels=None, idx=None):
         N = idx.shape[0]
-        adj_matrix = torch.zeros((N, N), device=labels.device)
+        adj_matrix = torch.zeros((N, N), device=idx.device)
         ll = idx.unsqueeze(0)
         adj_matrix[ll == ll.T] = 1
         
@@ -350,3 +345,28 @@ def knn_from_dist(dist_map, k):
     adj_matrix[batch_indices, knn_indices.reshape(-1)] = 1
 
     return adj_matrix
+
+class PartialGaussianKernel(GaussianKernel):
+    def __init__(self, sigma, mask, type='euclidean'):
+        super(PartialGaussianKernel, self).__init__(sigma, type=type)
+        self.mask = mask
+
+    def forward(self, features, labels = None, idx = None):
+        distances = DistancesKernel(type=self.type)(features)
+        distances.masked_fill(self.mask == 0, -float('inf'))
+        neighbors_prob = F.softmax(-distances / self.sigma**2, dim=1)
+        return neighbors_prob
+
+
+################## Clustering Kernels ##################
+class ClusteringKernel(Kernel):
+    def forward(self, cluster_probs, labels=None, idx=None):
+        if isinstance(cluster_probs, list) and len(cluster_probs) == 2:
+            probs, ema_probs = cluster_probs
+        else:
+            probs, ema_probs = cluster_probs, cluster_probs
+
+        cluster_sizes = probs.sum(dim=0)
+        neighbors_prob = (probs / cluster_sizes) @ ema_probs.t()
+
+        return neighbors_prob
