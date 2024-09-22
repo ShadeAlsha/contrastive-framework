@@ -1,13 +1,11 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import pytorch_lightning as pl
-import matplotlib.pyplot as plt
-import seaborn as sns
 from torchmetrics import Accuracy
 from metrics import UnsupervisedAccuracy
-from loss_helpers import kernel_cross_entropy, kernel_mse_loss, kernel_dot_loss
-import copy 
+from loss_helpers import *
+import copy
+from kernels import CauchyKernel
 class KernelModel(pl.LightningModule):
     def __init__(self, 
                  mapper, 
@@ -18,34 +16,132 @@ class KernelModel(pl.LightningModule):
                  lr=1e-3, 
                  accuracy_mode=None, 
                  loss_type='cross_entropy', 
-                 regularization_coeff=0,
+                 batch_view_coeff=2,
+                 early_exaggeration=3,
                  use_ema=False,
-                 ema_momentum=0.999):
+                 ema_momentum=0.999,
+                 initial_learned_leak=0, 
+                 initial_target_leak=0, 
+                 initial_beta=0.5,
+                 decay_factor=0.99,
+                 early_exaggeration_epochs=1,
+                 linear_probe=False):
         
         super().__init__()
-        self.mapper = mapper
-        self.target_kernel = target_kernel
-        self.learned_kernel = learned_kernel
-        self.embeddings_map = embeddings_map or (lambda x: x)
-        self.lr = lr
-        self.validation_step_outputs = []
-        self.train_loss_epoch = 0
-        self.val_loss_epoch = 0
-        self.regularization_coeff = regularization_coeff
-        self.accuracy_mode = accuracy_mode
-        self.use_ema = use_ema
-        self.ema_momentum = ema_momentum
+        self.save_hyperparameters()
+        self._init_model_components()
+        self._init_training_parameters()
+        self._init_loss_function(loss_type)
+        self._init_accuracy_metrics(accuracy_mode, num_classes)
         
-        # Create EMA mapper if enabled
+
+    def _init_model_components(self):
+        self.mapper = self.hparams.mapper
+        self.target_kernel = self.hparams.target_kernel
+        self.learned_kernel = self.hparams.learned_kernel
+        self.embeddings_map = self.hparams.embeddings_map or nn.Identity()
+        self.use_ema = self.hparams.use_ema
         if self.use_ema:
             self.ema_mapper = self._create_ema_mapper()
             self._copy_weights_to_ema()
         
-        self.loss = self._select_loss_function(loss_type)
-        self.train_acc, self.val_acc = self._configure_accuracy_metrics(accuracy_mode, num_classes)
+        self.linear_probe = self.hparams.linear_probe
+        if self.linear_probe:
+            self.linear_classifier = nn.Linear(self.mapper.output_dim, self.hparams.num_classes) 
+        else:
+            self.linear_classifier = nn.Identity() 
 
+    def _init_training_parameters(self):
+        self.lr = self.hparams.lr
+        self.early_exaggeration = self.hparams.early_exaggeration
+        self.early_exaggeration_epochs = self.hparams.early_exaggeration_epochs
+        self.batch_view_coeff = self.hparams.batch_view_coeff
+        self.learned_leak = self.hparams.initial_learned_leak
+        self.target_leak = self.hparams.initial_target_leak
+        self.beta = self.hparams.initial_beta
+        self.decay_factor = self.hparams.decay_factor
+
+        self.train_loss_epoch = 0
+        self.val_loss_epoch = 0
+        self.validation_step_outputs = []
+        self.training_kernels = []
+
+    def _init_loss_function(self, loss_type):
+        loss_functions = {
+            'cross_entropy': kernel_cross_entropy,
+            'l2': kernel_mse_loss,
+            'orthogonality_loss': kernel_dot_loss,
+            'barlow_twins': barlow_twins,
+            'none': lambda x, y: 0.0,
+        }
+        self.loss = loss_functions.get(loss_type)
+        if self.loss is None:
+            raise ValueError(f"Unsupported loss_type: {loss_type}")
+
+    def _init_accuracy_metrics(self, accuracy_mode, num_classes):
+        if accuracy_mode == 'regular':
+            self.train_acc, self.val_acc = Accuracy(task="multiclass", num_classes=num_classes), Accuracy(task="multiclass", num_classes=num_classes)
+        elif accuracy_mode == 'unsupervised':
+            self.train_acc, self.val_acc = UnsupervisedAccuracy(num_classes), UnsupervisedAccuracy(num_classes)
+        else:
+            self.train_acc, self.val_acc = None, None
+
+    def forward(self, x):
+        return self.mapper(x)
+    
+    def forward_ema(self, x):
+        return self.ema_mapper(x) if self.use_ema else None
+
+    def training_step(self, batch, batch_idx):
+        loss = self._shared_step(batch, 'train')
+        self._update_leak_and_beta()
+        if self.use_ema:
+            self._update_ema_weights()
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        return self._shared_step(batch, 'val')
+
+    def _shared_step(self, batch, phase):
+        features, labels, idx = batch
+        inner_embeddings = self.forward(features)
+        projection = self.embeddings_map(inner_embeddings)
+        ema_projection = self._compute_ema_embeddings(features, projection)
+
+        target_kernel = self._compute_target_kernel(features, labels, idx)
+        learned_kernel = self._compute_learned_kernel(projection, ema_projection, labels, idx)
+
+        kl_loss = self.loss(target_kernel, learned_kernel)
+        regularization_loss = self.batch_view_term(projection, target_kernel)
+        early_exaggeration_loss = self.early_exaggeration_term(projection, target_kernel)
+        linear_probe_loss = self._compute_linear_probe_loss(inner_embeddings.detach(), labels)
+        
+        total_loss = self._compute_total_loss(kl_loss, regularization_loss, early_exaggeration_loss, linear_probe_loss)
+        if self.linear_probe:
+            preds = self.linear_classifier(inner_embeddings.detach())
+        else:
+            preds = (projection)
+        self._log_step_metrics(phase, total_loss, projection, preds, labels, learned_kernel, target_kernel)
+        return total_loss
+    def _compute_linear_probe_loss(self, inner_embeddings, labels):
+        if self.linear_probe:
+            logits = self.linear_classifier(inner_embeddings.detach())
+            return nn.CrossEntropyLoss()(logits, labels.type(torch.LongTensor))
+        else:
+            return 0
+    
+    def configure_optimizers(self):
+        #use larger learning rate for the linear probe
+        optimizer = torch.optim.Adam([
+            {'params': self.mapper.parameters()},
+            {'params': self.embeddings_map.parameters()},
+            {'params': self.linear_classifier.parameters(), 'lr': 1e-2}
+        ], lr=self.lr)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+        return [optimizer], [scheduler]
+
+    # === EMA Methods ===
     def _create_ema_mapper(self):
-        """Creates a copy of the mapper network for EMA."""
         ema_mapper = copy.deepcopy(self.mapper)
         ema_mapper.eval()  # EMA is not updated through backprop
         for param in ema_mapper.parameters():
@@ -53,143 +149,97 @@ class KernelModel(pl.LightningModule):
         return ema_mapper
 
     def _copy_weights_to_ema(self):
-        """Copies the current weights to the EMA mapper."""
         for ema_param, param in zip(self.ema_mapper.parameters(), self.mapper.parameters()):
             ema_param.data.copy_(param.data)
 
     def _update_ema_weights(self):
-        """Updates EMA weights using the momentum parameter."""
         with torch.no_grad():
             for ema_param, param in zip(self.ema_mapper.parameters(), self.mapper.parameters()):
-                ema_param.data = self.ema_momentum * ema_param.data + (1.0 - self.ema_momentum) * param.data
+                ema_param.data = self.hparams.ema_momentum * ema_param.data + (1.0 - self.hparams.ema_momentum) * param.data
 
-    def forward(self, x):
-        return self.mapper(x)
-    
-    def forward_ema(self, x):
-        """Forward pass through the EMA mapper."""
-        return self.ema_mapper(x)
-    
-    def loss_fn(self, target_kernel, learned_kernel):
-        return self.loss(target_kernel, learned_kernel)
-
-    def training_step(self, batch, batch_idx):
-        return self._shared_step(batch, batch_idx, 'train')
-
-    def validation_step(self, batch, batch_idx):
-        return self._shared_step(batch, batch_idx, 'val')
-
-    def _shared_step(self, batch, batch_idx, phase):
-        features, labels, idx = batch
-        embeddings = self.embeddings_map(self.forward(features))
-
-        # Generate EMA embeddings if EMA is enabled
+    def _compute_ema_embeddings(self, features, embeddings):
         if self.use_ema:
             with torch.no_grad():
                 ema_embeddings = self.embeddings_map(self.forward_ema(features))
-                ema_embeddings = (ema_embeddings + embeddings) / 2
-        else:
-            ema_embeddings = embeddings  # Use same embeddings if EMA is disabled
+            return self.beta * ema_embeddings + (1 - self.beta) * embeddings
+        return embeddings
 
-        target_kernel = self.target_kernel(features, labels, idx)
-        learned_kernel = self.learned_kernel(([embeddings, ema_embeddings]), labels, idx)
+    # === Kernel Computation Methods ===
+    def _compute_target_kernel(self, features, labels, idx):
+        return self.target_kernel.leak(self.target_leak)(features, labels, idx)
 
-        loss = self.loss_fn(target_kernel, learned_kernel)
-        regularization_term = self.regularization_term(embeddings, target_kernel)
-        total_loss = loss + self.regularization_coeff * regularization_term
+    def _compute_learned_kernel(self, embeddings, ema_embeddings, labels, idx):
+        return self.learned_kernel.leak(self.learned_leak)([embeddings, ema_embeddings], labels, idx)
 
-        if phase == 'train':
-            self._log_training_step(loss, regularization_term, total_loss)
-            self.train_loss_epoch += loss.item()
-            self._update_accuracy(embeddings, labels, self.train_acc)
-            
-            if self.use_ema:
-                self._update_ema_weights()  # Update EMA weights during training
+    # === Training Helpers ===
+    def _update_leak_and_beta(self):
+        self.learned_leak = max(0, self.learned_leak * self.decay_factor)
+        self.target_leak = max(0, self.target_leak * self.decay_factor)
+        self.beta = max(0, self.beta * self.decay_factor)
 
-        else:
-            self.validation_step_outputs.append({
-                'embeddings': embeddings,
-                'labels': labels,
-                'learned_kernel': learned_kernel,
-                'target_kernel': target_kernel
-            })
-            self.log('val_loss', total_loss, on_step=True, on_epoch=False)
-            self.val_loss_epoch += total_loss.item()
-            self._update_accuracy(embeddings, labels, self.val_acc)
-
+    def _compute_total_loss(self, kl_loss, regularization_loss, early_exaggeration_loss, liner_probe_loss):
+        loss = kl_loss + liner_probe_loss
+        loss += self.hparams.batch_view_coeff * regularization_loss
+        loss += self.hparams.early_exaggeration * early_exaggeration_loss
         return loss
 
-    def on_train_epoch_end(self):
-        avg_train_loss = self.train_loss_epoch
-        self.log('train_loss_epoch', avg_train_loss, on_epoch=True)
-        self.train_loss_epoch = 0
-        self._compute_and_log_accuracy(self.train_acc, 'train')
-
-    def on_validation_epoch_end(self):
-        avg_val_loss = self.val_loss_epoch
-        self.log('val_loss_epoch', avg_val_loss, on_epoch=True)
-        self.val_loss_epoch = 0
-        self._compute_and_log_accuracy(self.val_acc, 'val')
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
-        return [optimizer], [scheduler]
-
-    def regularization_term(self, embeddings, target_kernel):
-        return 0  # Default regularization is zero
-
-    def _select_loss_function(self, loss_type):
-        if loss_type == 'cross_entropy':
-            return kernel_cross_entropy
-        elif loss_type == 'mse':
-            return kernel_mse_loss
-        elif loss_type == 'dot':
-            return kernel_dot_loss
+    def _log_step_metrics(self, phase, total_loss, embeddings, logits, labels, learned_kernel, target_kernel):
+        if phase == 'train':
+            self.train_loss_epoch += total_loss.item()
+            self._update_accuracy(logits, labels, self.train_acc)            
         else:
-            raise ValueError(f"Unsupported loss_type: {loss_type}")
-
-    def _configure_accuracy_metrics(self, accuracy_mode, num_classes):
-        if accuracy_mode == 'regular':
-            return Accuracy(), Accuracy()
-        elif accuracy_mode == 'unsupervised':
-            return UnsupervisedAccuracy(num_classes), UnsupervisedAccuracy(num_classes)
-        else:
-            return None, None
-
-    def _update_accuracy(self, embeddings, labels, acc_metric):
-        if acc_metric is None:
-            return
-
-        if self.accuracy_mode == 'unsupervised':
-            clusters = embeddings.argmax(dim=-1)
-            acc_metric.update(clusters, labels)
-        elif self.accuracy_mode == 'regular':
-            predictions = embeddings.argmax(dim=-1)
-            acc_metric.update(predictions, labels)
-
-    def _compute_and_log_accuracy(self, acc_metric, phase):
-        if acc_metric is None:
-            return
-
-        accuracy = acc_metric.compute()
-        self.log(f'{phase}_accuracy', accuracy, on_epoch=True)
-        print(f'{phase} accuracy: {accuracy}')
-        acc_metric.reset()
-
-    def _log_training_step(self, loss, regularization_term, total_loss):
-        self.log('train_loss', loss, on_step=True, on_epoch=False)
-        self.log('train_reg_loss', regularization_term, on_step=True, on_epoch=False)
-        self.log('train_total_loss', total_loss, on_step=True, on_epoch=False)
-
+            self.validation_step_outputs.append({
+                'learned_kernel': learned_kernel,
+                'target_kernel': target_kernel,
+                'embeddings': embeddings,
+                'logits': logits,
+                'labels': labels,
+            })
+            self.val_loss_epoch += total_loss.item()
+            self._update_accuracy(logits, labels, self.val_acc)
     def _aggregate_validation_outputs(self):
         outputs = self.validation_step_outputs
         all_embeddings = torch.cat([output['embeddings'] for output in outputs], dim=0)
-        print(all_embeddings.shape)
         all_labels = torch.cat([output['labels'] for output in outputs], dim=0)
         all_learned_kernels = torch.cat([output['learned_kernel'] for output in outputs], dim=0)
         all_target_kernels = torch.cat([output['target_kernel'] for output in outputs], dim=0)
         self.validation_step_outputs.clear()
+        
         return all_embeddings.cpu(), all_labels.cpu(), all_learned_kernels.cpu(), all_target_kernels.cpu()
     
-    
+    # === Accuracy Helpers ===
+    def _update_accuracy(self, embeddings, labels, acc_metric):
+        if acc_metric is None:
+            return
+        predictions = embeddings.argmax(dim=-1)
+        acc_metric.update(predictions, labels)
+
+    def on_train_epoch_end(self):
+        self.log('train_loss_epoch', self.train_loss_epoch, on_epoch=True)
+        self.train_loss_epoch = 0
+        self._compute_and_log_accuracy(self.train_acc, 'train')
+
+    def on_validation_epoch_end(self):
+        self.log('val_loss_epoch', self.val_loss_epoch, on_epoch=True)
+        self.val_loss_epoch = 0
+        self._compute_and_log_accuracy(self.val_acc, 'val')
+
+    def _compute_and_log_accuracy(self, acc_metric, phase):
+        if acc_metric:
+            accuracy = acc_metric.compute()
+            self.log(f'{phase}_accuracy', accuracy, on_epoch=True)
+            acc_metric.reset()
+            print(f'{phase} accuracy: {accuracy}')
+
+    # === Regularization ===
+    def early_exaggeration_term(self, embeddings, target_kernel):
+        if self.current_epoch < self.hparams.early_exaggeration_epochs:
+            distance = -(embeddings @ embeddings.T)*target_kernel
+            return -distance.sum()
+        else:
+            return 0
+    def batch_view_term(self, embeddings, target_kernel):
+        if self.batch_view_coeff > 0:
+            return barlow_twins_kl(embeddings, target_kernel)
+            #return BarlowTwinsLoss(embeddings.device)(embeddings, target_kernel)       
+        return 0

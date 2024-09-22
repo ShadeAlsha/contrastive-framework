@@ -168,10 +168,10 @@ class DistancesKernel(Kernel):
         self.type = type
 
     def forward(self, features, labels=None, idx=None):
-        if features.dim() == 2:
-            online_features, ema_features = features, features
-        else:
+        if isinstance(features, list) and len(features) == 2:
             online_features, ema_features = features[0], features[1]
+        else:
+            online_features, ema_features = features, features
 
         if self.type == 'euclidean':
             distances = torch.cdist(online_features, ema_features, p=2)
@@ -184,23 +184,25 @@ class DistancesKernel(Kernel):
         return distances
 
 class GaussianKernel(Kernel):
-    def __init__(self, sigma=None, perplexity=None, mode='sigma', type='euclidean', mask_diagonal=True):
+    def __init__(self, sigma=None, sigma_grid=None, perplexity=None, mode='sigma', type='euclidean', mask_diagonal=True, symmetric=True):
         super(GaussianKernel, self).__init__()
-        assert mode in ['sigma', 'perplexity_binary_search', 'perplexity_heuristic'], \
-            "Mode must be either 'sigma', 'perplexity_binary_search', or 'perplexity_heuristic'"
+        assert mode in ['sigma', 'perplexity_binary_search', 'perplexity_heuristic', 'perplexity_grid_search'], \
+            "Mode must be either 'sigma', 'perplexity_binary_search', 'perplexity_heuristic', or 'perplexity_grid_search'"
         
         if mode == 'sigma' and sigma is None:
             raise ValueError("Sigma must be provided when mode is 'sigma'")
-        if mode in ['perplexity_binary_search', 'perplexity_heuristic'] and perplexity is None:
-            raise ValueError("Perplexity must be provided when mode is 'perplexity_binary_search' or 'perplexity_heuristic'")
+        if mode in ['perplexity_binary_search', 'perplexity_heuristic', 'perplexity_grid_search'] and perplexity is None:
+            raise ValueError("Perplexity must be provided when mode is 'perplexity_binary_search', 'perplexity_heuristic', or 'perplexity_grid_search'")
         
         self.sigma = sigma
+        self.sigma_grid = sigma_grid
         self.perplexity = perplexity
         self.mode = mode
         self.type = type
         self.mask_diagonal = mask_diagonal
+        self.symmetric = symmetric
 
-    def forward(self, features, labels=None, idx=None):
+    def forward(self, features, labels=None, idx=None, return_log=False):
         # Step 1: Compute pairwise distances
         distances = DistancesKernel(type=self.type)(features)
 
@@ -208,22 +210,52 @@ class GaussianKernel(Kernel):
             mask = 1 - torch.eye(distances.size(0), device=distances.device)
             distances.masked_fill(mask == 0, float('inf'))
 
-        # Step 2: Select the mode and compute probabilities
-        if self.mode == 'sigma':
-            neighbors_prob = self.compute_probabilities_with_sigma(distances)
-        elif self.mode == 'perplexity_binary_search':
-            neighbors_prob = self.compute_probabilities_with_perplexity_binary_search(distances)
+        # Step 2: Initialize sigma grid if needed
+        if self.mode == 'perplexity_grid_search' and self.sigma_grid is None:
+            d_median = torch.median(distances[distances != float('inf')])
+            self.sigma_grid = torch.logspace(-2, 2, steps=100, device=distances.device) * d_median
+
+        # Step 3: Select the mode and compute probabilities
+        if self.mode == 'perplexity_binary_search':
+            self.sigma = self.find_sigma_with_perplexity_binary_search(distances)
         elif self.mode == 'perplexity_heuristic':
-            neighbors_prob = self.compute_probabilities_with_perplexity_heuristic(distances)
+            self.sigma = self.find_sigma_with_perplexity_heuristic(distances, k=int(self.perplexity))
+        elif self.mode == 'perplexity_grid_search':
+            self.sigma = self.find_best_sigma_grid_search_for_each_point(distances)
 
+        neighbors_prob = self.compute_probabilities_with_sigma(distances, return_log)
+        
+        if self.symmetric and not return_log:
+            neighbors_prob = (neighbors_prob + neighbors_prob.T) / 2
         return neighbors_prob
 
-    def compute_probabilities_with_sigma(self, distances):
-        # Compute Gaussian similarities using the provided sigma
-        neighbors_prob = F.softmax(-distances / self.sigma**2, dim=1)
+    def find_best_sigma_grid_search_for_each_point(self, distances):
+        """Grid search over sigma values to match the desired perplexity for each point."""
+        probabilities = self.compute_probabilities_for_sigma_grid(distances)
+        entropy = -torch.sum(probabilities * torch.log(probabilities + 1e-10), dim=2)  # Compute entropy for each point and each sigma
+        perplexity_diff = torch.abs(torch.exp(entropy) - self.perplexity)
+        best_sigma_idx = torch.argmin(perplexity_diff, dim=1)  # Find best sigma for each point
+        return self.sigma_grid[best_sigma_idx]
+
+    def compute_probabilities_for_sigma_grid(self, distances):
+        """Compute probabilities for all sigma values in the grid for each point."""
+        distances = distances.unsqueeze(-1)  # Add an extra dimension for broadcasting
+        sigmas_squared = self.sigma_grid**2
+        exp_distances = torch.exp(-distances / sigmas_squared)
+        probabilities = exp_distances / torch.sum(exp_distances, dim=1, keepdim=True)
+        return probabilities  # Shape: (N, N, num_sigma)
+
+    def compute_probabilities_with_sigma(self, distances, return_log=False):
+        """Compute Gaussian similarities using the selected sigma for each point."""
+        sigmas = self.sigma#.unsqueeze(1)  # Shape: (N, 1)
+        if return_log:
+            neighbors_prob = torch.log_softmax(-distances / sigmas**2, dim=1)
+        else:
+            neighbors_prob = F.softmax(-distances / sigmas**2, dim=1)
         return neighbors_prob
 
-    def compute_probabilities_with_perplexity_binary_search(self, distances):
+
+    def find_sigma_with_perplexity_binary_search(self, distances):
         n = distances.size(0)
         P = torch.zeros_like(distances)
         beta = torch.ones(n, device=distances.device)  # Beta is 1 / (2 * sigma^2)
@@ -257,7 +289,7 @@ class GaussianKernel(Kernel):
 
         return P
 
-    def compute_probabilities_with_perplexity_heuristic(self, distances, k=None):
+    def find_sigma_with_perplexity_heuristic(self, distances, k=None):
         n = distances.size(0)
         
         # Set k as the perplexity if not provided
@@ -273,25 +305,36 @@ class GaussianKernel(Kernel):
         # Compute sigma as the mean of the k-nearest neighbors distances for each point
         sigma = torch.mean(k_nearest_neighbors, dim=1, keepdim=True)
 
-        # Compute probabilities using the vectorized sigma
-        P = F.softmax(-distances / (sigma**2 + 1e-8), dim=1)
-
-        return P
+        return sigma
 
 class CauchyKernel(Kernel):
-    def __init__(self, gamma, type='euclidean', mask_diagonal=True):
+    def __init__(self, gamma, type='euclidean', mask_diagonal=True, symmetric=False, normalize=True):
         super(CauchyKernel, self).__init__()
         self.gamma = gamma
         self.type = type
         self.mask_diagonal = mask_diagonal
+        self.symmetric = symmetric
+        self.normalize = normalize
 
-    def forward(self,  features, labels = None, idx = None):
+    def forward(self,  features, labels = None, idx = None, return_log = False):
         distances = DistancesKernel(type=self.type)(features)
         neighbors_prob_unormalized = 1 / (1 + (distances / self.gamma)**2)
         if self.mask_diagonal:
             mask = 1 - torch.eye(neighbors_prob_unormalized.size(0), device=neighbors_prob_unormalized.device)
             neighbors_prob_unormalized.masked_fill(mask == 0, 0)
-        neighbors_prob = F.normalize(neighbors_prob_unormalized, p=1, dim=1)
+        if self.normalize:
+            neighbors_prob = (
+                torch.log(neighbors_prob_unormalized)
+                - torch.log(neighbors_prob_unormalized.sum(dim=1, keepdim=True))
+                if return_log
+                else F.normalize(neighbors_prob_unormalized, p=1, dim=1)
+            )
+        elif return_log:
+            neighbors_prob = torch.log(neighbors_prob_unormalized)
+        else:
+            neighbors_prob = neighbors_prob_unormalized
+        if self.symmetric and not return_log and not self.normalize:
+            neighbors_prob = (neighbors_prob + neighbors_prob.T) / 2
         return neighbors_prob
 
 ################## Graph Kernels ##################
@@ -365,6 +408,7 @@ class ClusteringKernel(Kernel):
             probs, ema_probs = cluster_probs
         else:
             probs, ema_probs = cluster_probs, cluster_probs
+        #probs, ema_probs = F.softmax(probs, dim=-1), F.softmax(ema_probs, dim=-1)
 
         cluster_sizes = probs.sum(dim=0)
         neighbors_prob = (probs / cluster_sizes) @ ema_probs.t()

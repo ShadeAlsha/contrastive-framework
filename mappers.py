@@ -3,9 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class MLPMapper(nn.Module):
-    def __init__(self, input_dim = 28*28, hidden_dims=(512, 256, 128), output_dim = 2, probablities = False, mode = 'softmax'):
+    def __init__(self, input_dim = 28*28, hidden_dims=(512, 512, 2000), output_dim = 2, probablities = False, mode = 'softmax'):
         if hidden_dims is None:
-            hidden_dims = [512, 256, 128]
+            hidden_dims = ()
         super(MLPMapper, self).__init__()
         layers = []
         in_dim = input_dim
@@ -16,6 +16,7 @@ class MLPMapper(nn.Module):
         self.network = nn.Sequential(*layers)
         self.probablities = probablities
         self.mode = mode
+        self.output_dim = output_dim
 
     def forward(self, x):
         logits = self.network(x)
@@ -23,6 +24,10 @@ class MLPMapper(nn.Module):
             if self.mode == 'softmax':
                 logits = F.softmax(logits, dim=1)
             elif self.mode == 'cauchy':
-                locals = 1 / (1 + logits**2)
-                logits = F.normalize(locals, p=1, dim=1)
+                logits = 1 / (1 + logits**2)
+                logits = F.normalize(logits, p=1, dim=1)
         return logits 
+    
+class IdentityMap(nn.Module):
+    def forward(self, x):
+        return x
