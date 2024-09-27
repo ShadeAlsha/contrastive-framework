@@ -58,19 +58,32 @@ class PlotLogger(pl.Callback):
         ax.legend(fontsize=12)
         ax.grid(True, which="both", linestyle="--", linewidth=0.5)
 
-    def plot_cluster_sizes(self, probablities, ax=None):
-        """Plot the sizes of the clusters."""
+
+    def plot_cluster_sizes(self, probabilities, ax=None):
+        """Plot the sizes of the clusters with uncertainty error bars."""
         if ax is None:
             ax = plt.gca()  # Get current axis
-        cluster_sizes = probablities.sum(dim=0)
-        cluster_sizes, _ = torch.sort(cluster_sizes, descending=True)
-
-        ax.plot(cluster_sizes.cpu(), color='skyblue')
-        ax.set_title('Cluster Sizes', fontsize=16)
+        
+        # Calculate cluster sizes (sum of probabilities across the batch)
+        cluster_sizes = probabilities.sum(dim=0)
+        #uncertinity is sum(p*(1-p))/N for each point
+        uncertainty = (probabilities*(1-probabilities)).sum(dim=0)/probabilities.size(0)
+        uncertainty = torch.sqrt(uncertainty)
+        
+        # Sort cluster sizes and uncertainties in descending order
+        cluster_sizes, indices = torch.sort(cluster_sizes, descending=True)
+        uncertainty = uncertainty[indices]
+        
+        cluster_sizes_np = cluster_sizes.cpu().numpy()
+        uncertainty_np = uncertainty.cpu().numpy()
+        classes = np.arange(len(cluster_sizes_np))
+        ax.bar(classes, cluster_sizes_np, yerr=uncertainty_np, capsize=5, color='skyblue')
+        
+        ax.set_title('Cluster Sizes with Uncertainty', fontsize=16)
         ax.set_xlabel('Cluster Index', fontsize=14)
         ax.set_ylabel('Number of Points', fontsize=14)
         ax.grid(True, linestyle='--', linewidth=0.5)
-
+        
     def plot_probabilities_star(self, probs, labels, cluster_names=None, radius=1, ax=None):
         """Plot star-shaped probability visualization."""
         if cluster_names is None:
@@ -113,9 +126,10 @@ class PlotLogger(pl.Callback):
         trainer.logger.experiment.add_image(tag, image, global_step=trainer.global_step, dataformats='HWC')
         plt.close(figure)
 
-    def show_selected_plots(self, trainer, pl_module, embeddings, labels, learned_kernel, target_kernel, probs=None):
+    def show_selected_plots(self, trainer, pl_module, embeddings, logits, labels, learned_kernel, target_kernel, probs=None):
         """Show or log the selected plots."""
-        fig, axes = plt.subplots(1, len(self.selected_plots), figsize=(6 * len(self.selected_plots), 5))
+        fig, axes = plt.subplots(1, len(self.selected_plots), figsize=(15 * len(self.selected_plots), 5))
+        probs = (logits)
 
         if len(self.selected_plots) == 1:
             axes = [axes]
@@ -126,18 +140,18 @@ class PlotLogger(pl.Callback):
             elif plot_name == 'neighborhood_dist':
                 self.plot_neighborhood_dist(learned_kernel, target_kernel, ax=ax)
             elif plot_name == 'probabilities_star':
-                self.plot_probabilities_star(embeddings, labels, ax=ax)
+                self.plot_probabilities_star(probs, labels, ax=ax)
             elif plot_name == 'cluster_sizes':
-                self.plot_cluster_sizes(embeddings, ax=ax)
+                self.plot_cluster_sizes(probs, ax=ax)
 
         if self.show_plots:
             plt.tight_layout()
             plt.show()
         else:
-            for i, plot_name in enumerate(self.selected_plots):
+            for plot_name in self.selected_plots:
                 self.log_figure_to_tensorboard(fig, plot_name, trainer, pl_module)
 
     def on_validation_epoch_end(self, trainer, pl_module):
         """Log or display plots at the end of each validation epoch."""
-        all_embeddings, all_labels, all_learned_kernels, all_target_kernels = pl_module._aggregate_validation_outputs()
-        self.show_selected_plots(trainer, pl_module, all_embeddings, all_labels, all_learned_kernels, all_target_kernels)
+        all_embeddings, all_logits, all_labels, all_learned_kernels, all_target_kernels = pl_module._aggregate_validation_outputs()
+        self.show_selected_plots(trainer, pl_module, all_embeddings, all_logits, all_labels, all_learned_kernels, all_target_kernels)

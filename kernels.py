@@ -148,16 +148,16 @@ class NeighborPropagationKernel(Kernel):
 
     def forward(self, *args, **kwargs):
         # Compute the base adjacency matrix
-        adj_matrix = self.base_kernel(*args, **kwargs)
-        adj_matrix = (adj_matrix+ adj_matrix.T)/2
+        adj_matrix = self.base_kernel(*args, **kwargs).to('cuda')
+        adj_matrix = (adj_matrix+ adj_matrix.T)
         
         # Apply neighbor propagation for the specified number of steps
-        smooth_adj_matrix = adj_matrix.clone()
+        smooth_adj_matrix = adj_matrix.clone() + torch.eye(adj_matrix.size(0), device=adj_matrix.device)
         for _ in range(self.steps):
             smooth_adj_matrix = torch.mm(smooth_adj_matrix, adj_matrix)
-            smooth_adj_matrix = (smooth_adj_matrix > 0).float()
+        smooth_adj_matrix = (smooth_adj_matrix > 0).float()
 
-        return smooth_adj_matrix
+        return F.normalize(smooth_adj_matrix, p=1, dim=1)
 
 
 
@@ -184,6 +184,41 @@ class DistancesKernel(Kernel):
         return distances
 
 class GaussianKernel(Kernel):
+    def __init__(self, sigma=None, mode='sigma', type='euclidean', mask_diagonal=True, symmetric=False):
+        super(GaussianKernel, self).__init__()
+        self.sigma = sigma
+        self.mode = mode
+        self.type = type
+        self.mask_diagonal = mask_diagonal
+        self.symmetric = symmetric
+
+    def forward(self, features, labels=None, idx=None, return_log=False):
+        # Step 1: Compute pairwise distances
+        distances = DistancesKernel(type=self.type)(features)
+
+        if self.mask_diagonal:
+            mask = 1 - torch.eye(distances.size(0), device=distances.device)
+            distances.masked_fill(mask == 0, float('inf'))
+            
+        neighbors_prob = self.compute_probabilities_with_sigma(distances, return_log)
+        
+        if self.symmetric and not return_log:
+            neighbors_prob = (neighbors_prob + neighbors_prob.T) / 2
+        return neighbors_prob
+
+    def compute_probabilities_with_sigma(self, distances, return_log=False, sigma=None):
+        if sigma is None:
+            sigma = self.sigma
+        softmax_map = torch.log_softmax if return_log else F.softmax
+        logits = (-distances / sigma**2)
+        if self.symmetric:
+            neighbors_prob = softmax_map(logits.reshape(-1), dim=0).reshape(logits.shape)
+        else:
+            neighbors_prob = softmax_map(logits, dim=1)
+        return neighbors_prob
+
+
+class GaussianKernel2(Kernel):
     def __init__(self, sigma=None, sigma_grid=None, perplexity=None, mode='sigma', type='euclidean', mask_diagonal=True, symmetric=True):
         super(GaussianKernel, self).__init__()
         assert mode in ['sigma', 'perplexity_binary_search', 'perplexity_heuristic', 'perplexity_grid_search'], \
@@ -366,12 +401,18 @@ class LabelsKernel(Kernel):
         return neighbors_prob
 
 class AugmentationKernel(Kernel):
+    #add init method with num_views
+    def __init__(self, num_views=None):
+        super(AugmentationKernel, self).__init__()
+        self.num_views = num_views
     def forward(self, features=None, labels=None, idx=None):
         N = idx.shape[0]
-        adj_matrix = torch.zeros((N, N), device=idx.device)
+        if self.num_views:
+            adj_matrix = create_block_diagonal_matrix(m = N//self.num_views, n = self.num_views, device=idx.device)
+        else:
+            adj_matrix = torch.zeros((N, N), device=idx.device)
         ll = idx.unsqueeze(0)
         adj_matrix[ll == ll.T] = 1
-        
         # Set diagonal to zero to remove self-connections
         adj_matrix.fill_diagonal_(0)
         
@@ -414,3 +455,21 @@ class ClusteringKernel(Kernel):
         neighbors_prob = (probs / cluster_sizes) @ ema_probs.t()
 
         return neighbors_prob
+
+# add zero kernel
+
+class ZeroKernel(Kernel):
+    def __init__(self):
+        super(ZeroKernel, self).__init__()
+    def forward(self, *args, **kwargs):
+        return torch.zeros(1, 1)
+    
+def create_block_diagonal_matrix(m, n=3, device='cuda'):
+    # Create an n x n matrix of ones
+    block = torch.ones(n, n).to(device)
+    
+    # Repeat the block m times on the diagonal
+    blocks = [block] * m
+    matrix = torch.block_diag(*blocks)
+    
+    return matrix

@@ -15,24 +15,28 @@ class KernelModel(pl.LightningModule):
                  embeddings_map=None, 
                  lr=1e-3, 
                  accuracy_mode=None, 
-                 loss_type='cross_entropy', 
-                 batch_view_coeff=2,
-                 early_exaggeration=3,
                  use_ema=False,
                  ema_momentum=0.999,
+                 loss_type='cross_entropy', 
                  initial_learned_leak=0, 
                  initial_target_leak=0, 
                  initial_beta=0.5,
+                 batch_view_coeff=0,
+                 early_exaggeration=0,
                  decay_factor=0.99,
-                 early_exaggeration_epochs=1,
-                 linear_probe=False):
+                 early_exaggeration_epochs=0,
+                 linear_probe=False,
+                 bt_leak = 0):
         
         super().__init__()
         self.save_hyperparameters()
+        
         self._init_model_components()
         self._init_training_parameters()
         self._init_loss_function(loss_type)
         self._init_accuracy_metrics(accuracy_mode, num_classes)
+        self.bt_leak = bt_leak
+        print("initialized")
         
 
     def _init_model_components(self):
@@ -41,16 +45,16 @@ class KernelModel(pl.LightningModule):
         self.learned_kernel = self.hparams.learned_kernel
         self.embeddings_map = self.hparams.embeddings_map or nn.Identity()
         self.use_ema = self.hparams.use_ema
+        
         if self.use_ema:
             self.ema_mapper = self._create_ema_mapper()
             self._copy_weights_to_ema()
         
         self.linear_probe = self.hparams.linear_probe
-        if self.linear_probe:
-            self.linear_classifier = nn.Linear(self.mapper.output_dim, self.hparams.num_classes) 
+        if self.hparams.linear_probe:
+            self.linear_classifier = nn.Linear(self.mapper.output_dim, self.hparams.num_classes)
         else:
-            self.linear_classifier = nn.Identity() 
-
+            self.linear_classifier = nn.Identity()
     def _init_training_parameters(self):
         self.lr = self.hparams.lr
         self.early_exaggeration = self.hparams.early_exaggeration
@@ -101,41 +105,39 @@ class KernelModel(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         return self._shared_step(batch, 'val')
+    def on_validation_epoch_start(self):
+        self.validation_step_outputs.clear()
 
     def _shared_step(self, batch, phase):
         features, labels, idx = batch
+        features, labels, idx = features.to(self.device), labels.to(self.device), idx.to(self.device)
         inner_embeddings = self.forward(features)
         projection = self.embeddings_map(inner_embeddings)
-        ema_projection = self._compute_ema_embeddings(features, projection)
-
-        target_kernel = self._compute_target_kernel(features, labels, idx)
-        learned_kernel = self._compute_learned_kernel(projection, ema_projection, labels, idx)
-
-        kl_loss = self.loss(target_kernel, learned_kernel)
-        regularization_loss = self.batch_view_term(projection, target_kernel)
-        early_exaggeration_loss = self.early_exaggeration_term(projection, target_kernel)
-        linear_probe_loss = self._compute_linear_probe_loss(inner_embeddings.detach(), labels)
+        logits = self.linear_classifier(inner_embeddings.detach())
         
-        total_loss = self._compute_total_loss(kl_loss, regularization_loss, early_exaggeration_loss, linear_probe_loss)
-        if self.linear_probe:
-            preds = self.linear_classifier(inner_embeddings.detach())
-        else:
-            preds = (projection)
-        self._log_step_metrics(phase, total_loss, projection, preds, labels, learned_kernel, target_kernel)
+        ema_projection = self._compute_ema_embeddings(features, projection)
+        learned_kernel = self._compute_learned_kernel(projection, ema_projection, labels, idx)
+        if phase == 'train':
+            target_kernel = self._compute_target_kernel(features, labels, idx)
+            kl_loss = self.loss(target_kernel, learned_kernel)
+            regularization_loss = self._compute_batch_view_term(projection, target_kernel)
+            early_exaggeration_loss = self._compute_early_exaggeration_term(projection, target_kernel)
+            linear_probe_loss = self._compute_linear_probe_loss(logits, labels)
+            total_loss = self._compute_total_loss(kl_loss, regularization_loss, early_exaggeration_loss, linear_probe_loss)
+        else: #loss is zero for validation
+            total_loss = torch.tensor(0.0, device=self.device)
+            target_kernel = torch.ones_like(learned_kernel)
+        self._log_step_metrics(phase, total_loss, projection, logits, labels, learned_kernel, target_kernel)
         return total_loss
-    def _compute_linear_probe_loss(self, inner_embeddings, labels):
-        if self.linear_probe:
-            logits = self.linear_classifier(inner_embeddings.detach())
-            return nn.CrossEntropyLoss()(logits, labels.type(torch.LongTensor))
-        else:
-            return 0
+    def _compute_linear_probe_loss(self, logits, labels):
+        return nn.CrossEntropyLoss()(logits, labels.long()) if self.linear_probe else 0
     
     def configure_optimizers(self):
         #use larger learning rate for the linear probe
         optimizer = torch.optim.Adam([
             {'params': self.mapper.parameters()},
             {'params': self.embeddings_map.parameters()},
-            {'params': self.linear_classifier.parameters(), 'lr': 1e-2}
+            {'params': self.linear_classifier.parameters(), 'lr': 5e-3}
         ], lr=self.lr)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
         return [optimizer], [scheduler]
@@ -163,7 +165,12 @@ class KernelModel(pl.LightningModule):
                 ema_embeddings = self.embeddings_map(self.forward_ema(features))
             return self.beta * ema_embeddings + (1 - self.beta) * embeddings
         return embeddings
-
+    def _compute_ema_embeddings(self, features, embeddings):
+        if self.use_ema:
+            with torch.no_grad():
+                ema_embeddings = self.embeddings_map(self.forward_ema(features))
+            return self.beta * ema_embeddings + (1 - self.beta) * embeddings
+        return embeddings
     # === Kernel Computation Methods ===
     def _compute_target_kernel(self, features, labels, idx):
         return self.target_kernel.leak(self.target_leak)(features, labels, idx)
@@ -178,6 +185,12 @@ class KernelModel(pl.LightningModule):
         self.beta = max(0, self.beta * self.decay_factor)
 
     def _compute_total_loss(self, kl_loss, regularization_loss, early_exaggeration_loss, liner_probe_loss):
+        #log the losses
+        self.log('kl_loss', kl_loss)
+        self.log('regularization_loss', regularization_loss)
+        self.log('early_exaggeration_loss', early_exaggeration_loss)
+        self.log('linear_probe_loss', liner_probe_loss)
+        
         loss = kl_loss + liner_probe_loss
         loss += self.hparams.batch_view_coeff * regularization_loss
         loss += self.hparams.early_exaggeration * early_exaggeration_loss
@@ -200,12 +213,16 @@ class KernelModel(pl.LightningModule):
     def _aggregate_validation_outputs(self):
         outputs = self.validation_step_outputs
         all_embeddings = torch.cat([output['embeddings'] for output in outputs], dim=0)
+        all_logits = torch.cat([output['logits'] for output in outputs], dim=0)
         all_labels = torch.cat([output['labels'] for output in outputs], dim=0)
         all_learned_kernels = torch.cat([output['learned_kernel'] for output in outputs], dim=0)
         all_target_kernels = torch.cat([output['target_kernel'] for output in outputs], dim=0)
+        
+        # Clear the outputs after processing to free memory
         self.validation_step_outputs.clear()
         
-        return all_embeddings.cpu(), all_labels.cpu(), all_learned_kernels.cpu(), all_target_kernels.cpu()
+        return all_embeddings.cpu(), all_logits.cpu(), all_labels.cpu(), all_learned_kernels.cpu(), all_target_kernels.cpu()
+
     
     # === Accuracy Helpers ===
     def _update_accuracy(self, embeddings, labels, acc_metric):
@@ -232,14 +249,16 @@ class KernelModel(pl.LightningModule):
             print(f'{phase} accuracy: {accuracy}')
 
     # === Regularization ===
-    def early_exaggeration_term(self, embeddings, target_kernel):
+    def _compute_early_exaggeration_term(self, embeddings, target_kernel):
         if self.current_epoch < self.hparams.early_exaggeration_epochs:
             distance = -(embeddings @ embeddings.T)*target_kernel
-            return -distance.sum()
+            return distance.sum()
         else:
             return 0
-    def batch_view_term(self, embeddings, target_kernel):
+    def _compute_batch_view_term(self, embeddings, target_kernel):
         if self.batch_view_coeff > 0:
-            return barlow_twins_kl(embeddings, target_kernel)
+            return clustering_twins(embeddings, target_kernel, leak = self.bt_leak)
             #return BarlowTwinsLoss(embeddings.device)(embeddings, target_kernel)       
         return 0
+    def _cluster_size_regularization(self, embeddings, target_kernel):
+        return -torch.log(embeddings.sum(dim=0)).sum()
