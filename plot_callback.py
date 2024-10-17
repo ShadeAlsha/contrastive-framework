@@ -19,7 +19,7 @@ class PlotLogger(pl.Callback):
         if ax is None:
             ax = plt.gca()  # Get current axis
         sns.scatterplot(x=embeddings[:, 0], y=embeddings[:, 1], hue=labels,
-                        palette=sns.color_palette("tab10"), edgecolor='none', ax=ax)
+                        palette=sns.color_palette("tab10"), edgecolor='none', ax=ax, alpha=0.7, s=30)
         ax.set_title("2D Embeddings Visualization", fontsize=16)
         ax.set_xlabel("Embedding Dimension 1", fontsize=14)
         ax.set_ylabel("Embedding Dimension 2", fontsize=14)
@@ -99,18 +99,24 @@ class PlotLogger(pl.Callback):
 
         x = probs @ vertices_x
         y = probs @ vertices_y
-
-        cmap = plt.get_cmap('tab10')
-        colors = cmap(torch.linspace(0, 1, 10))[:n_clusters]
-
-        ax.scatter(vertices_x, vertices_y, c='black', s=300, marker='*', alpha=0.5)
+        
+        #cmap = plt.get_cmap('tab10')
+        #colors = cmap(torch.linspace(0, 1, 10))[:n_clusters]
+        colors = [
+                    "#D95252",
+                    "#FFBF00",
+                    "#4CAF50",
+                    "#4A9AC3",
+                    "#8E5ED0",
+                ]
 
         for i in range(n_clusters):
             mask = (labels == i)
-            ax.scatter(x[mask], y[mask], color=colors[i], alpha=0.8, label=cluster_names[i])
+            ax.scatter(x[mask], y[mask], color=colors[i], s= 250, alpha=0.15, label=f'digit {i}')
 
         for i, name in enumerate(cluster_names):
-            ax.text(vertices_x[i] * 1.05, vertices_y[i] * 1.05, f' {name}', ha='center', fontsize=14, color='black')
+            ax.text(vertices_x[i] * 1.2, vertices_y[i] * 1.2, f' ', ha='center', fontsize=14, color='black')
+        ax.scatter(vertices_x, vertices_y, c='black', s=400, marker='*', alpha=1)
 
         ax.set_xticks([])
         ax.set_yticks([])
@@ -128,7 +134,7 @@ class PlotLogger(pl.Callback):
 
     def show_selected_plots(self, trainer, pl_module, embeddings, logits, labels, learned_kernel, target_kernel, probs=None):
         """Show or log the selected plots."""
-        fig, axes = plt.subplots(1, len(self.selected_plots), figsize=(15 * len(self.selected_plots), 5))
+        fig, axes = plt.subplots(1, len(self.selected_plots), figsize=(5 * len(self.selected_plots), 5))
         probs = (logits)
 
         if len(self.selected_plots) == 1:

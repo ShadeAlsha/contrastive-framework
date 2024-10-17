@@ -17,8 +17,24 @@ def kernel_cross_entropy(target_kernel_matrix, learned_kernel_matrix, eps=1e-10)
     N = target_kernel_matrix.shape[0]
     return cross_entropy_loss/N
 
+def jsd_loss(p, q, reduction='batchmean'):
+    # Compute the pointwise average distribution M
+    m = 0.5 * (p + q)
+    kl_pm = F.kl_div(m.log(), p, reduction=reduction, log_target=True)
+    kl_qm = F.kl_div(m.log(), q, reduction=reduction, log_target=True)
+    
+    jsd = 0.5 * (kl_pm + kl_qm)
+    return jsd
+
+def kernel_tv_loss(target_kernel_matrix, learned_kernel_matrix):
+    return 0.5 * torch.abs(target_kernel_matrix - learned_kernel_matrix).mean()
+    
 def kernel_mse_loss(target_kernel_matrix, learned_kernel_matrix):
     return ((target_kernel_matrix-learned_kernel_matrix)**2).mean()
+
+def kernel_hellinger_loss(target_kernel_matrix, learned_kernel_matrix):
+    #note: we technically should take squar root of the result
+    return (torch.sqrt(target_kernel_matrix)-torch.sqrt(learned_kernel_matrix)).pow(2).mean()
 
 def kernel_dot_loss(target_kernel_matrix, learned_kernel_matrix):
    return -(target_kernel_matrix*learned_kernel_matrix).mean()

@@ -149,10 +149,10 @@ class NeighborPropagationKernel(Kernel):
     def forward(self, *args, **kwargs):
         # Compute the base adjacency matrix
         adj_matrix = self.base_kernel(*args, **kwargs).to('cuda')
-        adj_matrix = (adj_matrix+ adj_matrix.T)
+        adj_matrix = (adj_matrix + torch.eye(adj_matrix.size(0), device=adj_matrix.device))
         
         # Apply neighbor propagation for the specified number of steps
-        smooth_adj_matrix = adj_matrix.clone() + torch.eye(adj_matrix.size(0), device=adj_matrix.device)
+        smooth_adj_matrix = adj_matrix.clone()
         for _ in range(self.steps):
             smooth_adj_matrix = torch.mm(smooth_adj_matrix, adj_matrix)
         smooth_adj_matrix = (smooth_adj_matrix > 0).float()
@@ -375,7 +375,7 @@ class CauchyKernel(Kernel):
 ################## Graph Kernels ##################
 
 class KnnKernel(Kernel):
-    def __init__(self, k, type='euclidean'):
+    def __init__(self, k, type='cosine'):
         super(KnnKernel, self).__init__()
         self.k = k
         self.type = type
@@ -402,21 +402,26 @@ class LabelsKernel(Kernel):
 
 class AugmentationKernel(Kernel):
     #add init method with num_views
-    def __init__(self, num_views=None):
+    def __init__(self, num_views=None, find_all_neighbors=False, neighbors_prop=None):
         super(AugmentationKernel, self).__init__()
         self.num_views = num_views
+        self.find_all_neighbors = find_all_neighbors
+        self.neighbors_prop = neighbors_prop
     def forward(self, features=None, labels=None, idx=None):
         N = idx.shape[0]
         if self.num_views:
-            adj_matrix = create_block_diagonal_matrix(m = N//self.num_views, n = self.num_views, device=idx.device)
+            if self.neighbors_prop:
+                block = torch.ones(self.num_views, self.num_views).to(idx.device)
+            else:
+                block = knn_block(self.num_views, device=idx.device)
+            adj_matrix = create_block_diagonal_matrix(block, m = N//self.num_views)
         else:
             adj_matrix = torch.zeros((N, N), device=idx.device)
-        ll = idx.unsqueeze(0)
-        adj_matrix[ll == ll.T] = 1
-        # Set diagonal to zero to remove self-connections
+        if self.find_all_neighbors:
+            ll = idx.unsqueeze(0)
+            adj_matrix[ll == ll.T] = 1
+            # Set diagonal to zero to remove self-connections
         adj_matrix.fill_diagonal_(0)
-        
-        # Normalize the adjacency matrix
         neighbors_prob = F.normalize(adj_matrix, p=1, dim=1)
         return neighbors_prob
     
@@ -464,12 +469,18 @@ class ZeroKernel(Kernel):
     def forward(self, *args, **kwargs):
         return torch.zeros(1, 1)
     
-def create_block_diagonal_matrix(m, n=3, device='cuda'):
+def create_block_diagonal_matrix(block, m):
     # Create an n x n matrix of ones
-    block = torch.ones(n, n).to(device)
+    #block = torch.ones(n, n).to(device)
     
     # Repeat the block m times on the diagonal
     blocks = [block] * m
     matrix = torch.block_diag(*blocks)
     
     return matrix
+
+def knn_block(n, device='cuda'):
+    block = torch.zeros(n, n).to(device)
+    block[0, :] = 1
+    block[:, 0] = 1
+    return block

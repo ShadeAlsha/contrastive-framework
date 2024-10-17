@@ -4,92 +4,22 @@ from torchvision import datasets, transforms
 from os.path import join
 import random
 
-class IndexedDataset(Dataset):
-    def __init__(self, dataset):
-        self.dataset = dataset
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, index):
-        image, label = self.dataset[index]
-        return image, label, index
-
-def get_mnist_dataloaders(limit=5, batch_size=5000, data_dir='data'):
-    # Define a transformation that includes flattening
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,)),
-        transforms.Lambda(lambda x: x.view(-1))  # Flatten the tensor
-    ])
-
-    # Load the MNIST dataset with the transformation
-    mnist_train = datasets.MNIST(data_dir, train=True, download=True, transform=transform)
-    mnist_test = datasets.MNIST(data_dir, train=False, download=True, transform=transform)
-
-    # Vectorized filtering to keep only samples where the label is less than the limit
-    train_indices = torch.nonzero(torch.tensor(mnist_train.targets) < limit).squeeze()
-    test_indices = torch.nonzero(torch.tensor(mnist_test.targets) < limit).squeeze()
-
-    # Create subsets of filtered indices
-    mnist_train_filtered = Subset(mnist_train, train_indices)
-    mnist_test_filtered = Subset(mnist_test, test_indices)
-
-    # Wrap the filtered datasets with the IndexedDataset to include image_index
-    mnist_train_indexed = IndexedDataset(mnist_train_filtered)
-    mnist_test_indexed = IndexedDataset(mnist_test_filtered)
-
-    # Create DataLoaders
-    train_loader = DataLoader(mnist_train_indexed, batch_size=batch_size, shuffle=True, num_workers = 24)
-    test_loader = DataLoader(mnist_test_indexed, batch_size=len(test_indices), shuffle=True, num_workers = 24)
-
-    return train_loader, test_loader
-
-
-def load_val_embed(path, file_name="val_masked"):
-    emb_val = torch.load(join(path, f"{file_name}_embeds.pt"), map_location="cpu")
-    targets_val = torch.load(
-        join(path, f"{file_name}_labels.pt"), map_location="cpu"
-    ).to(torch.int)
-    return emb_val, targets_val
-
-
-def load_multiview_embed(
-    path, file_name="train_masked", total_num_views=1, num_unmasked=1
-):
+def load_train_embeddings(model_name = "dino-vits", num_views=1, file_name =  lambda i: f"embeddings_{i+1}.pt"):
+    path = f"/datadrive/pytorch-data/imagenet-{model_name}"
     embeddings_list = []
-
-    for i in range(num_unmasked):
-        embeds = torch.load(join(path, f"train_unmasked_embeds_{i}.pt"), map_location="cpu")
+    for i in range(num_views):
+        embeds = torch.load(join(path, file_name(i)), map_location="cpu")
         embeddings_list.append(embeds)
 
-    for i in range(total_num_views):
-        for j in [1, 2]:
-            embeds = torch.load(join(path, f"{file_name}_embeds{j}_{i}.pt"), map_location="cpu")
-            embeddings_list.append(embeds)
-
     emb_train = torch.stack(embeddings_list, dim=1)
-    label_train = torch.load(join(path, f"{file_name}_labels_0.pt"), map_location="cpu").to(torch.int)
-
-    return emb_train, label_train
-def load_train_embed_dino_base(path="/datadrive/shaden/contrastive-framework/dinovitb-embeddings", num_views=1):
-    embeddings_list = []
-    count = 0
-    for i in range(num_views//4+1):
-        for gpu_id in range(4):
-            embeds = torch.load(join(path, f"embeddings_{gpu_id}_{i+1}.pt"), map_location="cpu")
-            embeddings_list.append(embeds)
-            count += 1
-        if count == num_views:
-            break
-    emb_train = torch.stack(embeddings_list, dim=1)
-    label_train = torch.load(join(path, f"train_labels.pt"), map_location="cpu").to(torch.int)
+    label_train = torch.load(join(path, "train_labels.pt"), map_location="cpu").to(torch.int)
     return emb_train, label_train
 
-def load_val_embed_dino_base(path="/datadrive/shaden/contrastive-framework/dinovitb-embeddings/embeddings_val"):
-    emb_val = torch.load(join(path, "embeddings.pt"), map_location="cpu")
+def load_val_embeddings(model_name = "dino-vits"):
+    path = f"/datadrive/pytorch-data/imagenet-{model_name}"
+    emb_val = torch.load(join(path, "embeddings_val.pt"), map_location="cpu")
     targets_val = torch.load(
-        join(path, "labels.pt"), map_location="cpu"
+        join(path, "labels_val.pt"), map_location="cpu"
     ).to(torch.int)
     return emb_val, targets_val
 
@@ -108,18 +38,31 @@ class ContrastiveDatasetFromList(Dataset):
         views_idx = random.sample(self.augmentation_idx, self.num_views)
         views = self.x_v[idx, views_idx, :]  # Select views, shape: [num_views, d]
         
-        # Reshape views to [num_views * d]
         views_reshaped = views.view(-1, views.shape[-1])  # Shape: [n_views, d]
-
-        # Repeat the label for each view
         labels_repeated = self.labels[idx].repeat(self.num_views)  # Shape: [n_views]
-
-        # Create an index tensor repeated for each view
         indices_repeated = torch.tensor([idx] * self.num_views)  # Shape: [n_views]
 
         return views_reshaped, labels_repeated, indices_repeated
 
 
+class ContrastiveDatasetFromList(Dataset):
+    def __init__(self, x_views, labels, num_views):
+        self.x_v = x_views  # Shape: (b, num_views, d)
+        self.labels = labels  # Shape: (b,)
+        self.num_views = num_views
+        self.augmentation_idx = list(range(x_views.shape[1]))  # List of views
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        # Sample random views for the batch
+        views_idx = random.sample(self.augmentation_idx, self.num_views)
+        views = self.x_v[idx, views_idx, :]  # Select views, shape: [num_views, d]
+        
+        views_reshaped = views.view(-1, views.shape[-1])  # Shape: [n_views, d]
+        return views_reshaped, self.labels[idx], idx
+    
 class ContrastiveDatasetFromListwKNN(Dataset):
     def __init__(self, x_views, labels, num_views, knn_indices, num_neighbors=2):
         self.x_v = x_views
@@ -138,7 +81,10 @@ class ContrastiveDatasetFromListwKNN(Dataset):
         views = self.x_v[idx, views_idx, :]  # Select views, shape: [num_views, d]
         
         # Sample multiple neighbors
-        neighbor_indices = random.sample(list(self.knn_indices[idx, :]), self.num_neighbors)
+        if self.num_neighbors > self.knn_indices.shape[1]:
+            neighbor_indices = random.choices(list(self.knn_indices[idx, :]), k=self.num_neighbors)
+        else:
+            neighbor_indices = random.sample(list(self.knn_indices[idx, :]), self.num_neighbors)
         knn_views = []
         
         for neighbor_idx in neighbor_indices:
@@ -256,5 +202,47 @@ def get_contrastive_dataloaders(batch_size=256, num_views=2, dataset_name='cifar
                              num_workers=num_workers,
                              collate_fn=custom_collate_fn,
                              pin_memory=False)
+
+    return train_loader, test_loader
+
+
+class IndexedDataset(Dataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        image, label = self.dataset[index]
+        return image, label, index
+
+def get_mnist_dataloaders(limit=5, batch_size=5000, data_dir='data'):
+    # Define a transformation that includes flattening
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,)),
+        transforms.Lambda(lambda x: x.view(-1))  # Flatten the tensor
+    ])
+
+    # Load the MNIST dataset with the transformation
+    mnist_train = datasets.MNIST(data_dir, train=True, download=True, transform=transform)
+    mnist_test = datasets.MNIST(data_dir, train=False, download=True, transform=transform)
+
+    # Vectorized filtering to keep only samples where the label is less than the limit
+    train_indices = torch.nonzero(torch.tensor(mnist_train.targets) < limit).squeeze()
+    test_indices = torch.nonzero(torch.tensor(mnist_test.targets) < limit).squeeze()
+
+    # Create subsets of filtered indices
+    mnist_train_filtered = Subset(mnist_train, train_indices)
+    mnist_test_filtered = Subset(mnist_test, test_indices)
+
+    # Wrap the filtered datasets with the IndexedDataset to include image_index
+    mnist_train_indexed = IndexedDataset(mnist_train_filtered)
+    mnist_test_indexed = IndexedDataset(mnist_test_filtered)
+
+    # Create DataLoaders
+    train_loader = DataLoader(mnist_train_indexed, batch_size=batch_size, shuffle=True, num_workers = 24)
+    test_loader = DataLoader(mnist_test_indexed, batch_size=len(test_indices), shuffle=True, num_workers = 24)
 
     return train_loader, test_loader
