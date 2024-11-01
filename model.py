@@ -52,11 +52,14 @@ class KernelModel(pl.LightningModule):
 
     def _initialize_mapper2(self):
         if self.hparams.use_ema:
+            print("Using EMA for the second view")
             mapper2 = self._create_ema_mapper()
             self._copy_weights_to_ema()
         elif self.hparams.mapper2:
+            print("Using a separate mapper for the second view")
             mapper2 = self.hparams.mapper2
         else:
+            print("Using the same mapper for both views")
             mapper2 = self.mapper
         return mapper2
 
@@ -91,6 +94,7 @@ class KernelModel(pl.LightningModule):
             'unsupervised': lambda: UnsupervisedAccuracy(num_classes),
         }
         self.train_acc, self.val_acc = (accuracy_classes.get(accuracy_mode, lambda: (None, None))() for _ in range(2))
+        self.train_acc, self.val_acc = None, None
 
     # === Kernel Computation Methods ===
     def _compute_kernel(self, kernel_fn, features1, features2, labels, idx):
@@ -115,7 +119,7 @@ class KernelModel(pl.LightningModule):
         if features.shape[1] == 2: #TODO: this is a hacky way to handle the case where we have two views, need to fix this
             features1, features2 = features[:, 0, :], features[:, 1, :]
         else:
-            features1, features2 = features[:, 0, :], features[:, 0, :]
+            features1, features2 = features, features
 
         inner_embeddings1, inner_embeddings2 = self.forward(features1, features2)
         projection1, projection2 = self.get_embeddings(inner_embeddings1, inner_embeddings2)
@@ -155,7 +159,7 @@ class KernelModel(pl.LightningModule):
     def _log_step_metrics(self, phase, total_loss, embeddings, logits, labels, learned_kernel, target_kernel):
         if phase == 'train':
             self.train_loss_epoch += total_loss.item()
-            self._update_accuracy(logits, labels, self.train_acc)
+            self._update_accuracy(logits, labels, self.train_acc)            
         else:
             self.validation_step_outputs.append({
                 'learned_kernel': learned_kernel,
@@ -205,6 +209,7 @@ class KernelModel(pl.LightningModule):
 
     def on_train_epoch_end(self):
         self.log('train_loss_epoch', self.train_loss_epoch, on_epoch=True)
+        print(f'train_loss_epoch: {self.train_loss_epoch}')
         self.train_loss_epoch = 0
         self._compute_and_log_accuracy(self.train_acc, 'train')
 
@@ -212,8 +217,6 @@ class KernelModel(pl.LightningModule):
         self.log('val_loss_epoch', self.val_loss_epoch, on_epoch=True)
         self.val_loss_epoch = 0
         self._compute_and_log_accuracy(self.val_acc, 'val')
-        #self._aggregate_validation_outputs()
-        self.validation_step_outputs.clear()
 
     def _compute_and_log_accuracy(self, acc_metric, phase):
         if acc_metric:
@@ -221,6 +224,19 @@ class KernelModel(pl.LightningModule):
             self.log(f'{phase}_accuracy', accuracy, on_epoch=True)
             self.acc_logs[phase].append(accuracy)
             print(f'max {phase} accuracy: {max(self.acc_logs[phase])}')
+
+    def _aggregate_validation_outputs(self):
+        outputs = self.validation_step_outputs
+        all_embeddings = torch.cat([output['embeddings'] for output in outputs], dim=0)
+        all_logits = torch.cat([output['logits'] for output in outputs], dim=0)
+        all_labels = torch.cat([output['labels'] for output in outputs], dim=0)
+        all_learned_kernels = torch.cat([output['learned_kernel'] for output in outputs], dim=0)
+        all_target_kernels = torch.cat([output['target_kernel'] for output in outputs], dim=0)
+        
+        # Clear the outputs after processing to free memory
+        self.validation_step_outputs.clear()
+        
+        return all_embeddings.cpu(), all_logits.cpu(), all_labels.cpu(), all_learned_kernels.cpu(), all_target_kernels.cpu()
 
     # === Regularization ===
     def _compute_early_exaggeration_term(self, embeddings1, embeddings2, target_kernel):

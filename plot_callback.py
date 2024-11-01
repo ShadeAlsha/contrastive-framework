@@ -100,15 +100,9 @@ class PlotLogger(pl.Callback):
         x = probs @ vertices_x
         y = probs @ vertices_y
         
-        #cmap = plt.get_cmap('tab10')
-        #colors = cmap(torch.linspace(0, 1, 10))[:n_clusters]
-        colors = [
-                    "#D95252",
-                    "#FFBF00",
-                    "#4CAF50",
-                    "#4A9AC3",
-                    "#8E5ED0",
-                ]
+        cmap = plt.get_cmap('tab10')
+        colors = cmap(torch.linspace(0, 1, 10))[:n_clusters]
+        #colors = ["#D95252", "#FFBF00", "#4CAF50", "#4A9AC3", "#8E5ED0"]
 
         for i in range(n_clusters):
             mask = (labels == i)

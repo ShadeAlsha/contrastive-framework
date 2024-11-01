@@ -49,6 +49,10 @@ class Kernel(nn.Module):
     
     def neighbor_propagation(self, steps=1):
         return NeighborPropagationKernel(self, steps=steps)
+    def low_rank(self, q=10):
+        return LowRankKernel(self, q=q)
+    def spectral_features(self, q=10):
+        return SpectralKernel(self, q=q)
 
 ################## Kernel Operations ##################
 class CompositeKernel(Kernel):
@@ -114,6 +118,34 @@ class NormalizedKernel(Kernel):
         normalized_output = kernel_output / row_sums
         return normalized_output
 
+class LowRankKernel(Kernel):
+    def __init__(self, kernel, q=10):
+        super(LowRankKernel, self).__init__()
+        self.kernel = kernel
+        self.q = q
+
+    def forward(self, *args, **kwargs):
+        kernel_output = self.kernel(*args, **kwargs)
+        U, S, Vt = torch.linalg.svd(kernel_output)
+        L_reduced =  U[:, :self.q] @ torch.diag(S[:self.q]) @ Vt[:self.q, :]
+        return L_reduced
+    
+class SpectralKernel(Kernel):
+    def __init__(self, kernel, q=10):
+        super(SpectralKernel, self).__init__()
+        self.kernel = kernel
+        self.q = q
+
+    def forward(self, *args, **kwargs):
+        kernel_output = self.kernel(*args, **kwargs)
+        eigenvalues, eigenvectors = torch.linalg.eigh(kernel_output)
+        
+        top_eigenvectors = eigenvectors[:, -self.q:]  # Corresponding eigenvectors
+        
+        reconstructed_kernel = top_eigenvectors @ top_eigenvectors.T
+        
+        return reconstructed_kernel
+        
 class BinarizedKernel(Kernel):
     def __init__(self, base_kernel):
         super(BinarizedKernel, self).__init__()
@@ -184,13 +216,15 @@ class DistancesKernel(Kernel):
         return distances
 
 class GaussianKernel(Kernel):
-    def __init__(self, sigma=None, mode='sigma', type='euclidean', mask_diagonal=True, symmetric=False):
+    def __init__(self, sigma=None, mode='sigma', perplexity=30.0, type='euclidean', mask_diagonal=True, symmetric=False, joint=False):
         super(GaussianKernel, self).__init__()
         self.sigma = sigma
         self.mode = mode
+        self.perplexity = perplexity
         self.type = type
         self.mask_diagonal = mask_diagonal
         self.symmetric = symmetric
+        self.joint = joint
 
     def forward(self, features, labels=None, idx=None, return_log=False):
         # Step 1: Compute pairwise distances
@@ -198,10 +232,18 @@ class GaussianKernel(Kernel):
 
         if self.mask_diagonal:
             mask = 1 - torch.eye(distances.size(0), device=distances.device)
-            distances.masked_fill(mask == 0, float('inf'))
-            
-        neighbors_prob = self.compute_probabilities_with_sigma(distances, return_log)
-        
+            distances = distances.masked_fill(mask == 0, float('inf'))
+
+        # Step 2: Compute neighbors probabilities based on mode
+        if self.mode == 'sigma':
+            neighbors_prob = self.compute_probabilities_with_sigma(distances, return_log)
+        elif self.mode == 'perplexity_binary_search':
+            neighbors_prob = self.compute_probabilities_with_perplexity(distances, return_log, method='binary_search')
+        elif self.mode == 'perplexity_heuristic':
+            neighbors_prob = self.compute_probabilities_with_perplexity(distances, return_log, method='heuristic')
+        else:
+            raise ValueError(f"Invalid mode: {self.mode}")
+
         if self.symmetric and not return_log:
             neighbors_prob = (neighbors_prob + neighbors_prob.T) / 2
         return neighbors_prob
@@ -216,6 +258,44 @@ class GaussianKernel(Kernel):
         else:
             neighbors_prob = softmax_map(logits, dim=1)
         return neighbors_prob
+
+    def compute_probabilities_with_perplexity(self, distances, return_log=False, method='binary_search'):
+        target_entropy = torch.log(torch.tensor([self.perplexity], device=distances.device))
+        sigma = torch.ones(distances.size(0), device=distances.device)
+
+        if method == 'binary_search':
+            for i in range(distances.size(0)):
+                sigma[i] = self.find_optimal_sigma_binary_search(distances[i], target_entropy)
+        elif method == 'heuristic':
+            sigma = distances.mean(dim=1) / self.perplexity
+        else:
+            raise ValueError(f"Invalid method: {method}")
+
+        softmax_map = torch.log_softmax if return_log else F.softmax
+        logits = (-distances / sigma.view(-1, 1) ** 2)
+        neighbors_prob = softmax_map(logits, dim=1)
+        return neighbors_prob
+
+    def find_optimal_sigma_binary_search(self, distances, target_entropy, tol=1e-5, max_iter=5):
+        lower = 1e-10
+        upper = 1e+10
+        sigma = 1.0
+
+        for _ in range(max_iter):
+            prob = F.softmax(-distances / (sigma ** 2), dim=0)
+            entropy = -torch.sum(prob * torch.log(prob + 1e-10))
+
+            if torch.abs(entropy - target_entropy) < tol:
+                break
+
+            if entropy > target_entropy:
+                upper = sigma
+            else:
+                lower = sigma
+
+            sigma = (lower + upper) / 2
+
+        return sigma
 
 
 class GaussianKernel2(Kernel):
@@ -356,7 +436,7 @@ class CauchyKernel(Kernel):
         neighbors_prob_unormalized = 1 / (1 + (distances / self.gamma)**2)
         if self.mask_diagonal:
             mask = 1 - torch.eye(neighbors_prob_unormalized.size(0), device=neighbors_prob_unormalized.device)
-            neighbors_prob_unormalized.masked_fill(mask == 0, 0)
+            neighbors_prob_unormalized = neighbors_prob_unormalized.masked_fill(mask == 0, 0)
         if self.normalize:
             neighbors_prob = (
                 torch.log(neighbors_prob_unormalized)
@@ -385,7 +465,16 @@ class KnnKernel(Kernel):
         adj_matrix = knn_from_dist(distances, self.k)
         neighbors_prob = F.normalize(adj_matrix, p=1, dim=1)
         return neighbors_prob
+        
+def knn_from_dist(dist_map, k):
+    N = dist_map.shape[0]
+    adj_matrix = torch.zeros_like(dist_map)
 
+    knn_indices = torch.topk(dist_map, k + 1, largest=False, dim=1).indices[:, :k]
+    batch_indices = torch.arange(N).repeat_interleave(k)
+    adj_matrix[batch_indices, knn_indices.reshape(-1)] = 1
+
+    return adj_matrix
 class LabelsKernel(Kernel):
     def forward(self, features=None, labels=None, idx=None):
         N = labels.shape[0]
@@ -424,16 +513,6 @@ class AugmentationKernel(Kernel):
         adj_matrix.fill_diagonal_(0)
         neighbors_prob = F.normalize(adj_matrix, p=1, dim=1)
         return neighbors_prob
-    
-def knn_from_dist(dist_map, k):
-    N = dist_map.shape[0]
-    adj_matrix = torch.zeros_like(dist_map)
-
-    knn_indices = torch.topk(dist_map, k + 1, largest=False, dim=1).indices[:, 1:]
-    batch_indices = torch.arange(N).repeat_interleave(k)
-    adj_matrix[batch_indices, knn_indices.reshape(-1)] = 1
-
-    return adj_matrix
 
 class PartialGaussianKernel(GaussianKernel):
     def __init__(self, sigma, mask, type='euclidean'):
@@ -449,16 +528,20 @@ class PartialGaussianKernel(GaussianKernel):
 
 ################## Clustering Kernels ##################
 class ClusteringKernel(Kernel):
-    def forward(self, cluster_probs, labels=None, idx=None):
+    def __init__(self, mask_diagonal=False):
+        super(ClusteringKernel, self).__init__()
+        self.mask_diagonal = mask_diagonal
+    def forward(self, cluster_probs, labels=None, idx=None,):
         if isinstance(cluster_probs, list) and len(cluster_probs) == 2:
             probs, ema_probs = cluster_probs
         else:
             probs, ema_probs = cluster_probs, cluster_probs
-        #probs, ema_probs = F.softmax(probs, dim=-1), F.softmax(ema_probs, dim=-1)
-
+            
         cluster_sizes = probs.sum(dim=0)
         neighbors_prob = (probs / cluster_sizes) @ ema_probs.t()
 
+        if self.mask_diagonal:
+            pass
         return neighbors_prob
 
 # add zero kernel

@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from kernels import GaussianKernel
 from torch.nn import CrossEntropyLoss
 
-def kernel_cross_entropy(target_kernel_matrix, learned_kernel_matrix, eps=1e-10):
+def kernel_cross_entropy(target_kernel_matrix, learned_kernel_matrix, eps=1e-10, log = False):
     target_flat = target_kernel_matrix.flatten()
     learned_flat = learned_kernel_matrix.flatten()
 
@@ -12,10 +12,13 @@ def kernel_cross_entropy(target_kernel_matrix, learned_kernel_matrix, eps=1e-10)
 
     target_filtered = target_flat[non_zero_mask]
     learned_filtered = learned_flat[non_zero_mask]
-
-    cross_entropy_loss = -torch.sum(target_filtered * torch.log(learned_filtered))
-    N = target_kernel_matrix.shape[0]
-    return cross_entropy_loss/N
+    if log:
+        log_q =  learned_filtered
+    else:
+        log_q = torch.log(learned_filtered)
+    
+    cross_entropy_loss = -torch.sum(target_filtered * log_q)
+    return cross_entropy_loss/target_kernel_matrix.shape[0]
 
 def jsd_loss(p, q, reduction='batchmean'):
     # Compute the pointwise average distribution M
@@ -37,7 +40,7 @@ def kernel_hellinger_loss(target_kernel_matrix, learned_kernel_matrix):
     return (torch.sqrt(target_kernel_matrix)-torch.sqrt(learned_kernel_matrix)).pow(2).mean()
 
 def kernel_dot_loss(target_kernel_matrix, learned_kernel_matrix):
-   return -(target_kernel_matrix*learned_kernel_matrix).mean()
+    return -(target_kernel_matrix*learned_kernel_matrix).mean()
 
 def clustering_twins(embeddings, target_kernel, leak=0.4):
     n, d = embeddings.size()
